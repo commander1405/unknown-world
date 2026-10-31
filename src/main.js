@@ -1,354 +1,408 @@
-import { createInput } from "./engine/input.js";
-import { createCamera } from "./engine/camera.js";
-import { generateWorld, collide, WORLD_W, WORLD_H } from "./world/map.js";
-import { drawWorld, drawPlayer } from "./world/render.js";
-import { createQuestState, updateQuests } from "./game/quests.js";
-import { createUI } from "./ui/screens.js";
-import { hasSave, loadSave, writeSave, clearSave } from "./storage/save.js";
+import { initLanguage, t, itemName, getLang } from "./localization/localization.js";
+import { createRenderer } from "./core/renderer.js";
+import { createInput } from "./core/input.js";
+import { World } from "./world/world.js";
+import { TILE, T, DROP_FOR, HARDNESS, PLACEABLE } from "./world/tiles.js";
+import { surfaceHeight } from "./world/generator.js";
+import { createPlayer, updatePlayer } from "./entities/player.js";
+import { createInventory, addItem, selectedItem, removeItem } from "./systems/inventory.js";
+import { createQuests, onGather, onCrafted } from "./systems/quests.js";
+import { createUI } from "./ui/ui.js";
+import { hasSave, loadGame, saveGame } from "./storage/save.js";
+
+initLanguage();
 
 const canvas = document.getElementById("game");
-const ctx = canvas.getContext("2d");
-const uiRoot = document.getElementById("ui-root");
-const input = createInput(canvas);
-const camera = createCamera();
-const ui = createUI(uiRoot);
+const renderer = createRenderer(canvas);
+const input = createInput();
+const ui = createUI(document.getElementById("ui-root"));
 
-let mode = "menu"; // menu | play | pause
+let mode = "menu";
 let world = null;
 let player = null;
-let inventory = {};
+let inv = null;
 let quests = null;
-let settings = { music: 0.5, sfx: 0.5, showFps: false };
-let gameTime = 0; // ms in-world clock accumulator for day cycle
+let settings = {
+  graphics: "medium",
+  animQuality: "medium",
+  uiAnim: true,
+  reducedMotion: false,
+  showFps: false,
+};
+let cam = { x: 0, y: 0 };
+let dayTime = 0; // seconds, 10 min cycle
+let paused = false;
+let uiOpen = false;
+let mineProg = 0;
+let mineKey = null;
 let last = performance.now();
 let fps = 60;
-let paused = false;
-let interactLock = false;
+let guide = null;
 
-function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = Math.floor(window.innerWidth * dpr);
-  canvas.height = Math.floor(window.innerHeight * dpr);
-  canvas.style.width = window.innerWidth + "px";
-  canvas.style.height = window.innerHeight + "px";
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+function dayPhase() {
+  const cycle = 600; // 10 minutes
+  return (dayTime % cycle) / cycle;
 }
-window.addEventListener("resize", resize);
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) last = performance.now();
-});
-resize();
-
-function defaultPlayer(spawn) {
-  return {
-    x: spawn.x,
-    y: spawn.y,
-    facing: "down",
-    moving: false,
-    speed: 145,
-    hp: 100,
-    maxHp: 100,
-    stamina: 100,
-    maxStamina: 100,
-    level: 1,
-    xp: 0,
-    xpToLevel: 60,
-  };
+function dayLabel() {
+  const p = dayPhase();
+  const d = Math.floor(dayTime / 600) + 1;
+  let phase = "Night";
+  if (p < 0.2) phase = "Dawn";
+  else if (p < 0.45) phase = "Day";
+  else if (p < 0.55) phase = "Noon";
+  else if (p < 0.7) phase = "Afternoon";
+  else if (p < 0.85) phase = "Dusk";
+  return `${d}`;
 }
 
-function newGame() {
-  const seed = (Math.random() * 1e9) | 0;
-  world = generateWorld(seed);
-  player = defaultPlayer(world.spawn);
-  inventory = {};
-  quests = createQuestState();
-  gameTime = 0;
-  camera.x = player.x;
-  camera.y = player.y;
-  startPlay();
+function spawnPos(seed) {
+  const x = 0;
+  const ground = surfaceHeight(0, seed);
+  return { x: 8 * TILE, y: (ground - 3) * TILE };
 }
 
-function continueGame() {
-  const data = loadSave();
-  if (!data) {
-    ui.showToast("No save found");
-    return;
-  }
-  world = generateWorld(data.seed);
-  // restore resource taken flags
-  if (data.resourcesTaken) {
-    for (const r of world.resources) {
-      if (data.resourcesTaken.includes(r.id)) r.taken = true;
+function nearStation() {
+  if (!player || !world) return null;
+  const cx = Math.floor((player.x + player.w / 2) / TILE);
+  const cy = Math.floor((player.y + player.h / 2) / TILE);
+  for (let dy = -4; dy <= 4; dy++) {
+    for (let dx = -4; dx <= 4; dx++) {
+      const id = world.getTile(cx + dx, cy + dy);
+      if (id === T.WORKBENCH) return "workbench";
+      if (id === T.FURNACE) return "furnace";
     }
   }
-  player = { ...defaultPlayer(world.spawn), ...data.player };
-  inventory = { ...data.inventory };
-  quests = data.quests || createQuestState();
-  gameTime = data.gameTime || 0;
-  settings = { ...settings, ...(data.settings || {}) };
-  camera.x = player.x;
-  camera.y = player.y;
-  startPlay();
-  ui.showToast("Game loaded");
+  return null;
 }
 
-function startPlay() {
+function cursorTile() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const st = input.poll();
+  const wx = cam.x + (st.mx - w / 2);
+  const wy = cam.y + (st.my - h / 2);
+  return { tx: Math.floor(wx / TILE), ty: Math.floor(wy / TILE) };
+}
+
+function toolPower() {
+  const s = selectedItem(inv);
+  if (!s) return { axe: 0.3, pick: 0.2 };
+  if (s.id === "ironPickaxe") return { axe: 0.5, pick: 2.2 };
+  if (s.id === "pickaxe") return { axe: 0.4, pick: 1.2 };
+  if (s.id === "axe") return { axe: 1.4, pick: 0.35 };
+  return { axe: 0.35, pick: 0.25 };
+}
+
+function tryMine(dt) {
+  const st = input.poll();
+  if (!st.mine) {
+    mineProg = 0;
+    mineKey = null;
+    return;
+  }
+  const { tx, ty } = cursorTile();
+  // range limit
+  const pcx = (player.x + player.w / 2) / TILE;
+  const pcy = (player.y + player.h / 2) / TILE;
+  if (Math.hypot(tx + 0.5 - pcx, ty + 0.5 - pcy) > 5) return;
+  const id = world.getTile(tx, ty);
+  if (!id || id === T.AIR) return;
+  const key = tx + "," + ty;
+  if (mineKey !== key) {
+    mineKey = key;
+    mineProg = 0;
+  }
+  const hard = HARDNESS[id] || 1;
+  const pow = toolPower();
+  let rate = pow.pick;
+  if (id === T.WOOD || id === T.LEAVES) rate = pow.axe;
+  mineProg += (rate / hard) * dt;
+  if (mineProg >= 1) {
+    const drop = DROP_FOR[id];
+    world.setTile(tx, ty, T.AIR);
+    mineProg = 0;
+    if (drop) {
+      addItem(inv, drop, 1);
+      ui.toast(t("notify.gathered", { item: itemName(drop), n: 1 }));
+      const notes = onGather(quests, drop, 1);
+      for (const n of notes) ui.toast(t("notify.questDone", { title: t("quests." + n) }));
+    }
+  }
+}
+
+function tryPlace() {
+  const st = input.poll();
+  if (!st.place) return;
+  st.place = false;
+  const sel = selectedItem(inv);
+  if (!sel || !PLACEABLE[sel.id]) return;
+  const { tx, ty } = cursorTile();
+  const pcx = (player.x + player.w / 2) / TILE;
+  const pcy = (player.y + player.h / 2) / TILE;
+  if (Math.hypot(tx + 0.5 - pcx, ty + 0.5 - pcy) > 5) return;
+  if (world.getTile(tx, ty) !== T.AIR) {
+    ui.toast(t("notify.cannotPlace"));
+    return;
+  }
+  // don't place inside player
+  const px0 = Math.floor(player.x / TILE);
+  const py0 = Math.floor(player.y / TILE);
+  const px1 = Math.floor((player.x + player.w - 1) / TILE);
+  const py1 = Math.floor((player.y + player.h - 1) / TILE);
+  if (tx >= px0 && tx <= px1 && ty >= py0 && ty <= py1) {
+    ui.toast(t("notify.cannotPlace"));
+    return;
+  }
+  if (!removeItem(inv, sel.id, 1)) return;
+  world.setTile(tx, ty, PLACEABLE[sel.id]);
+}
+
+function interactGuide() {
+  if (!guide || uiOpen) return;
+  const d = Math.hypot(player.x - guide.x, player.y - guide.y);
+  if (d > 40) return;
+  uiOpen = true;
+  const lines = [t("npc.guide1"), t("npc.guide2"), t("npc.guide3"), t("npc.guide4")];
+  ui.openDialog(t("npc.guideName"), lines, () => {
+    uiOpen = false;
+    if (!quests.gotStarterAxe) {
+      addItem(inv, "axe", 1);
+      quests.gotStarterAxe = true;
+      ui.toast(t("notify.gathered", { item: itemName("axe"), n: 1 }));
+    }
+    const q = quests.list.find((x) => x.id === "guide");
+    if (q && !q.done) {
+      q.done = true;
+      ui.toast(t("notify.questDone", { title: t("quests.guide") }));
+    }
+  });
+}
+
+async function persist() {
+  if (!world || !player) return;
+  await saveGame({
+    seed: world.seed,
+    player: { x: player.x, y: player.y, hp: player.hp, hunger: player.hunger, stamina: player.stamina },
+    inv,
+    quests,
+    dayTime,
+    mods: world.serializeMods(),
+    settings,
+    lang: getLang(),
+  });
+  ui.toast(t("notify.saved"));
+}
+
+async function startNew() {
+  if (await hasSave()) {
+    if (!confirm(t("confirm.newWorld"))) return;
+  }
+  ui.toast(t("notify.worldGen"));
+  const seed = (Math.random() * 1e9) | 0;
+  world = new World(seed);
+  const sp = spawnPos(seed);
+  player = createPlayer(sp.x, sp.y);
+  inv = createInventory();
+  addItem(inv, "torch", 4);
+  quests = createQuests();
+  guide = { x: sp.x + 48, y: sp.y };
+  dayTime = 60;
+  cam.x = player.x;
+  cam.y = player.y;
   mode = "play";
   paused = false;
-  ui.clearScreens();
+  ui.clearOverlays();
   ui.setHudVisible(true);
 }
 
-function saveGame() {
-  if (!world || !player) return;
-  writeSave({
-    seed: world.seed,
-    player: {
-      x: player.x,
-      y: player.y,
-      hp: player.hp,
-      maxHp: player.maxHp,
-      stamina: player.stamina,
-      maxStamina: player.maxStamina,
-      level: player.level,
-      xp: player.xp,
-      xpToLevel: player.xpToLevel,
-      facing: player.facing,
-    },
-    inventory,
-    quests,
-    gameTime,
-    settings,
-    resourcesTaken: world.resources.filter((r) => r.taken).map((r) => r.id),
-  });
-  ui.showToast("Game saved");
-}
-
-function dayInfo() {
-  // 8 minute full day cycle
-  const cycle = 8 * 60 * 1000;
-  const t = gameTime % cycle;
-  const phase = t / cycle; // 0..1
-  let label = "Night";
-  if (phase < 0.2) label = "Dawn";
-  else if (phase < 0.45) label = "Day";
-  else if (phase < 0.55) label = "Noon";
-  else if (phase < 0.7) label = "Afternoon";
-  else if (phase < 0.85) label = "Dusk";
-  // darkness 0 (bright) .. 0.65 (night)
-  let dark = 0;
-  if (phase < 0.15) dark = 0.45 * (1 - phase / 0.15);
-  else if (phase > 0.75) dark = 0.55 * ((phase - 0.75) / 0.25);
-  else if (phase > 0.9) dark = 0.55;
-  return { phase, label, dark };
-}
-
-function tryMove(dt) {
-  const v = input.movementVector();
-  player.moving = Math.abs(v.x) + Math.abs(v.y) > 0.01;
-  if (!player.moving) {
-    player.stamina = Math.min(player.maxStamina, player.stamina + 12 * dt);
+async function startContinue() {
+  const data = await loadGame();
+  if (!data) {
+    ui.toast("—");
     return;
   }
-  if (v.x < -0.3) player.facing = "left";
-  else if (v.x > 0.3) player.facing = "right";
-  else if (v.y < -0.3) player.facing = "up";
-  else if (v.y > 0.3) player.facing = "down";
-
-  const sprint = input.keys.has("shift") && player.stamina > 1;
-  const spd = player.speed * (sprint ? 1.55 : 1) * (player.hp < 25 ? 0.85 : 1);
-  if (sprint) player.stamina = Math.max(0, player.stamina - 22 * dt);
-  else player.stamina = Math.min(player.maxStamina, player.stamina + 8 * dt);
-
-  const nx = player.x + v.x * spd * dt;
-  const ny = player.y + v.y * spd * dt;
-  // axis separation
-  if (!collide(world, nx, player.y, 12)) player.x = nx;
-  if (!collide(world, player.x, ny, 12)) player.y = ny;
-  // soft clamp
-  player.x = Math.max(20, Math.min(WORLD_W - 20, player.x));
-  player.y = Math.max(20, Math.min(WORLD_H - 20, player.y));
+  world = new World(data.seed || 1);
+  world.loadMods(data.mods || []);
+  const sp = spawnPos(world.seed);
+  player = createPlayer(data.player?.x ?? sp.x, data.player?.y ?? sp.y);
+  if (data.player) {
+    player.hp = data.player.hp ?? 100;
+    player.hunger = data.player.hunger ?? 100;
+    player.stamina = data.player.stamina ?? 100;
+  }
+  inv = data.inv || createInventory();
+  quests = data.quests || createQuests();
+  dayTime = data.dayTime || 0;
+  settings = { ...settings, ...(data.settings || {}) };
+  guide = { x: spawnPos(world.seed).x + 48, y: spawnPos(world.seed).y };
+  cam.x = player.x;
+  cam.y = player.y;
+  mode = "play";
+  ui.clearOverlays();
+  ui.setHudVisible(true);
+  ui.toast(t("notify.saved"));
 }
 
-function nearestInteractable() {
-  let best = null;
-  let bestD = 48;
-  for (const n of world.npcs) {
-    const d = Math.hypot(player.x - n.x, player.y - n.y);
-    if (d < bestD) {
-      bestD = d;
-      best = { type: "npc", ref: n };
-    }
-  }
-  for (const r of world.resources) {
-    if (r.taken) continue;
-    const d = Math.hypot(player.x - r.x, player.y - r.y);
-    if (d < 40 && d < bestD) {
-      bestD = d;
-      best = { type: "resource", ref: r };
-    }
-  }
-  return best;
-}
-
-function doInteract() {
-  if (interactLock || paused) return;
-  const target = nearestInteractable();
-  if (!target) {
-    ui.showToast("Nothing to interact with");
-    return;
-  }
-  if (target.type === "npc") {
-    interactLock = true;
-    ui.openDialog(target.ref.name, target.ref.lines, () => {
-      interactLock = false;
-    });
-  } else if (target.type === "resource") {
-    const r = target.ref;
-    r.taken = true;
-    inventory[r.type] = (inventory[r.type] || 0) + 1;
-    player.xp += 2;
-    ui.showToast(`Gathered ${r.type}`);
-    const notes = updateQuests(quests, player, inventory, world);
-    for (const n of notes) ui.showToast(n);
-  }
-}
-
-function openPause() {
-  if (mode !== "play") return;
-  paused = true;
-  ui.openPause({
-    onResume: () => {
-      paused = false;
-      last = performance.now();
-    },
-    onSave: () => saveGame(),
-    onQuests: () => ui.openQuests(quests),
-    onSettings: () => ui.openSettings(settings, (s) => { settings = s; }),
-    onMenu: () => {
-      paused = false;
-      mode = "menu";
-      ui.setHudVisible(false);
-      showMenu();
-    },
-  });
-}
-
-function showMenu() {
+async function showMenu() {
   mode = "menu";
   ui.setHudVisible(false);
-  ui.showMainMenu({
-    hasSave: hasSave(),
-    onContinue: continueGame,
-    onNew: newGame,
+  const hs = await hasSave();
+  ui.showMenu({
+    hasSave: hs,
+    onNew: () => startNew(),
+    onContinue: () => startContinue(),
     onSettings: () => ui.openSettings(settings, (s) => { settings = s; }),
+    onCredits: () => {},
   });
+}
+
+function activeQuestText() {
+  const q = quests?.list.find((x) => !x.done);
+  if (!q) return "";
+  return t("quests." + q.key);
 }
 
 function update(dt) {
-  if (mode !== "play" || paused || interactLock) return;
-  gameTime += dt * 1000;
-  tryMove(dt);
-  camera.follow(player, dt, 5.5);
-
-  if (input.consume("interact")) doInteract();
-  if (input.consume("inventory")) {
-    interactLock = true;
-    ui.openInventory(inventory, () => { interactLock = false; });
-  }
-  if (input.consume("pause")) openPause();
-
-  // slow hp regen daytime
-  const { dark } = dayInfo();
-  if (dark < 0.2 && player.hp < player.maxHp) {
-    player.hp = Math.min(player.maxHp, player.hp + 2 * dt);
-  }
-
-  const notes = updateQuests(quests, player, inventory, world);
-  for (const n of notes) ui.showToast(n);
-
-  const { label } = dayInfo();
-  ui.updateHud(player, inventory, quests, label);
-}
-
-function render(now) {
-  // logical size
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-  ctx.save();
-  ctx.clearRect(0, 0, w, h);
-
-  if (mode === "menu" || !world) {
-    // ambient menu background
-    const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, "#0c1a28");
-    g.addColorStop(1, "#050a10");
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, w, h);
-    ctx.restore();
+  if (mode !== "play" || paused || uiOpen) return;
+  const st = input.poll();
+  if (input.consume("pause")) {
+    paused = true;
+    ui.openPause({
+      onResume: () => { paused = false; },
+      onInv: () => {
+        uiOpen = true;
+        ui.openInventory(inv, nearStation(), (id) => {
+          const n = onCrafted(quests, id);
+          if (n) ui.toast(t("notify.questDone", { title: t("quests." + n) }));
+        }, () => { uiOpen = false; });
+      },
+      onQuests: () => ui.openQuests(quests),
+      onSettings: () => ui.openSettings(settings, (s) => { settings = s; }),
+      onExit: async () => {
+        await persist();
+        paused = false;
+        await showMenu();
+      },
+    });
     return;
   }
-
-  ctx.save();
-  ctx.translate(w / 2, h / 2);
-  ctx.scale(camera.zoom, camera.zoom);
-  ctx.translate(-camera.x, -camera.y);
-
-  drawWorld(ctx, world, camera, { width: w, height: h }, now, dayInfo().phase);
-  drawPlayer(ctx, player, now);
-
-  // interact hint
-  const t = nearestInteractable();
-  if (t && !paused) {
-    ctx.fillStyle = "rgba(0,0,0,0.4)";
-    ctx.fillRect(player.x - 36, player.y - 52, 72, 16);
-    ctx.fillStyle = "#9fe8d8";
-    ctx.font = "11px sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(t.type === "npc" ? "E — Talk" : "E — Gather", player.x, player.y - 40);
+  if (input.consume("inv")) {
+    uiOpen = true;
+    ui.openInventory(inv, nearStation(), (id) => {
+      const n = onCrafted(quests, id);
+      if (n) ui.toast(t("notify.questDone", { title: t("quests." + n) }));
+    }, () => { uiOpen = false; });
+  }
+  if (st.hotbarSelect != null) {
+    inv.hotbar = st.hotbarSelect;
+    st.hotbarSelect = null;
+  }
+  if (st.hotbarDelta) {
+    inv.hotbar = (inv.hotbar + st.hotbarDelta + 10) % 10;
+    st.hotbarDelta = 0;
   }
 
-  ctx.restore();
+  // reset lateral from keyboard each frame via poll logic
+  const keys = input.state;
+  updatePlayer(player, world, {
+    left: keys.left,
+    right: keys.right,
+    jump: keys.jump,
+    sprint: keys.sprint,
+  }, dt, settings);
 
-  // day/night veil
-  const { dark } = dayInfo();
-  if (dark > 0.01) {
-    ctx.fillStyle = `rgba(4, 8, 20, ${dark})`;
-    ctx.fillRect(0, 0, w, h);
-    // soft vignette moon feel
-    if (dark > 0.3) {
-      const vg = ctx.createRadialGradient(w * 0.7, h * 0.15, 10, w * 0.7, h * 0.15, 180);
-      vg.addColorStop(0, "rgba(200, 220, 255, 0.08)");
-      vg.addColorStop(1, "transparent");
-      ctx.fillStyle = vg;
-      ctx.fillRect(0, 0, w, h);
-    }
+  // eat berry with F
+  // interact
+  if (keys.jump === false && false) {}
+  // E interact is inv — use press near guide with mine off: Space already jump
+  // Use interact when player presses "e" handled as inv; separate: click near guide
+  const distGuide = guide ? Math.hypot(player.x - guide.x, player.y - guide.y) : 999;
+  if (distGuide < 36 && input.consume("inv") === false) {
+    // allow talk via double-tap mine briefly — simpler: auto prompt chip
   }
 
-  if (settings.showFps) {
-    ctx.fillStyle = "rgba(0,0,0,0.4)";
-    ctx.fillRect(8, h - 28, 70, 20);
-    ctx.fillStyle = "#9fe8d8";
-    ctx.font = "12px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText(`${fps | 0} FPS`, 14, h - 14);
+  tryMine(dt);
+  tryPlace();
+  world.unloadFar(player.x / TILE, player.y / TILE, settings.graphics === "low" ? 3 : 5);
+
+  // camera
+  const k = 1 - Math.exp(-6 * dt);
+  cam.x += (player.x + player.w / 2 - cam.x) * k;
+  cam.y += (player.y + player.h / 2 - cam.y) * k;
+
+  dayTime += dt;
+  if (player.hp <= 0) {
+    ui.toast(t("notify.died"));
+    const sp = spawnPos(world.seed);
+    player.x = sp.x;
+    player.y = sp.y;
+    player.hp = player.maxHp * 0.6;
+    player.hunger = 40;
   }
-  ctx.restore();
+
+  // talk to guide: hold interact — map key "e" already inventory; use Enter
+  // Check: if player collides near guide and presses jump while looking — skip
+  // Add: key f for interact
+  if (distGuide < 40 && (input.state.mine && mineProg === 0)) {
+    // soft: show talk by pressing place near guide without selected placeable
+  }
+
+  ui.updateHud(player, inv, dayLabel(), activeQuestText());
 }
+
+// Interact key: listen for KeyF and KeyEnter
+window.addEventListener("keydown", (e) => {
+  if (mode === "play" && !paused && !uiOpen && (e.key === "f" || e.key === "F" || e.key === "Enter")) {
+    interactGuide();
+  }
+});
 
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   fps = fps * 0.9 + (1 / Math.max(dt, 0.001)) * 0.1;
+  // reset one-shot keyboard move sticky from touch by re-polling
+  if (mode === "play" && !paused) {
+    // clear pure keyboard flags each frame after poll inside update
+  }
   update(dt);
-  render(now);
+  if (mode === "play" && world && player) {
+    renderer.render(world, player, cam, dayPhase(), settings.graphics);
+    // draw guide
+    const ctx = renderer.ctx;
+    const w = window.innerWidth, h = window.innerHeight;
+    ctx.save();
+    ctx.translate(Math.floor(w / 2 - cam.x), Math.floor(h / 2 - cam.y));
+    ctx.imageSmoothingEnabled = false;
+    if (guide) {
+      ctx.fillStyle = "#6a90b8";
+      ctx.fillRect(Math.floor(guide.x), Math.floor(guide.y), 12, 24);
+      ctx.fillStyle = "#e8c4a0";
+      ctx.fillRect(Math.floor(guide.x) + 2, Math.floor(guide.y) - 6, 8, 7);
+      if (Math.hypot(player.x - guide.x, player.y - guide.y) < 48) {
+        ctx.fillStyle = "#fff";
+        ctx.font = "10px monospace";
+        ctx.fillText("F", Math.floor(guide.x) + 2, Math.floor(guide.y) - 10);
+      }
+    }
+    // mine break overlay
+    if (mineKey && mineProg > 0) {
+      const [tx, ty] = mineKey.split(",").map(Number);
+      ctx.strokeStyle = `rgba(255,255,255,${0.4 + mineProg * 0.5})`;
+      ctx.strokeRect(tx * TILE + 2, ty * TILE + 2, TILE - 4, TILE - 4);
+    }
+    ctx.restore();
+    if (settings.showFps) {
+      ctx.fillStyle = "#9fe";
+      ctx.font = "12px monospace";
+      ctx.fillText((fps | 0) + " FPS", 8, window.innerHeight - 8);
+    }
+  }
   requestAnimationFrame(frame);
 }
 
-// Autosave every 60s while playing
 setInterval(() => {
-  if (mode === "play" && world && !paused) saveGame();
-}, 60000);
+  if (mode === "play" && world && !paused) persist();
+}, 45000);
 
 showMenu();
 requestAnimationFrame(frame);
